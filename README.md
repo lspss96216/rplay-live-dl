@@ -17,6 +17,7 @@
 ## 📑 Table of Contents
 
 - [📝 Description](#description)
+- [🔀 此 fork 的修改](#fork-changes)
 - [⚠️ v2 Upgrade Notes](#v2-upgrade-notes)
 - [✨ Features](#features)
 - [🚀 Quick Start](#quick-start)
@@ -43,6 +44,44 @@
 
 > [!WARNING]
 > **Vibe Coding Notice**: versions with the `-vibe` suffix (for example `2.0.0-vibe`) are AI-assisted releases. They pass automated tests, but you should still review breaking changes before upgrading production deployments.
+
+---
+
+<a id="fork-changes"></a>
+
+## 🔀 此 fork 的修改
+
+本 fork 基於上游 [Zhen-Bo/rplay-live-dl](https://github.com/Zhen-Bo/rplay-live-dl) v2.6.0，修正 2026 年 10 月 RPlay 改版後**偵測不到開台、也錄不到影片**的問題。
+
+### 為什麼要改
+
+RPlay 改了兩件事，讓原版失效：
+
+1. **開台清單加了瀏覽器檢查**：`/live/livestreams` 與 `/live/play` 現在要求通過瀏覽器驗證（回應標頭 `x-browser-check: required`）。程式直接呼叫時，清單一律回傳 `[]`，開台狀態被遮成 `offline`，所以原版永遠以為沒人開台。
+2. **串流改用 BytePlus**：直播改從 `/live/bytedance/play-urls` 取得**帶簽章的 FLV 網址**，網址 **180 秒後過期**。原本 `key2` 加 `playlist.m3u8` 的網址對這類直播會回 404。
+
+### 改了哪裡
+
+| 檔案 | 修改 |
+| --- | --- |
+| `core/rplay.py` | **偵測開台**：不再讀全站清單，改成對設定中的每位實況主，用帳號 JWT 呼叫 `/live/bytedance/play-urls`，有播放網址就視為開台；標題從 `/live/play` 取得。`get_livestream_status()` 改為接收要檢查的 creator ID 清單。 |
+| `core/rplay.py` | **開播時間**：新介面不提供開播時間，改用程式「第一次看到開台」的時間；連續 2 次檢查沒看到才清除，偶爾一次查不到不會被當成新的一場。 |
+| `core/rplay.py` | **播放網址**：`get_stream_url()` 每次呼叫都向 play-urls 取得最新網址（優先 `hd`，依序退回 `sd`/`ld`）；舊式（legacy）串流則照網站前端的格式組出網址。回應 403（付費或私人直播）時只略過該實況主，不會讓整輪檢查失敗。 |
+| `core/downloader.py` | **錄影**：輸出 `.ts` 時強制用 ffmpeg 錄成 MPEG-TS，FLV 輸入也能沿用原本的合併與孤兒救援流程。 |
+| `core/downloader.py` | **ffmpeg 參數**：非 HLS 的輸入會移除只適用 HLS 的 `-seg_max_retry`，否則 ffmpeg 會直接以 code 8 結束。 |
+| `core/downloader.py` | **斷線重試**：每次重試都重新取得播放網址，並寫進新的分段檔（`…_r01.ts`、`…_r02.ts`），合併時依序接起來。原版重試會覆蓋前一次錄到的內容。如果重試時已取不到網址（通常代表關台），就用已錄到的內容結束並合併。 |
+| `core/live_stream_monitor.py` | 傳入要檢查的實況主清單，並把「重新取得網址」的函式交給下載器，供重試使用。 |
+| `tests/` | 依新介面改寫狀態與網址相關測試，並新增重試分段、網址重取、ffmpeg 參數過濾的測試，共 534 個測試通過。 |
+
+### 驗證
+
+已在真實的 BytePlus 直播上端對端測試：程式自動偵測到開台、自動開始錄影，連續錄約 4 分鐘（跨過網址的 180 秒效期也沒有中斷），停止後自動合併成可完整解碼的 MP4（1280×720，標題與實況主資訊已寫入檔案）。
+
+### 限制
+
+- 偵測方式是逐一詢問每位實況主的播放網址，每輪檢查的請求數會隨監控人數增加。這是在避開 RPlay 對清單 API 的瀏覽器檢查；如果 RPlay 之後對 play-urls 也加上限制，就需要再調整。
+- 舊式（legacy，非 BytePlus）串流的網址格式是依網站前端程式碼實作的，尚未在真實的舊式直播上驗證。
+- 開播時間是本機第一次偵測到的時間，不是 RPlay 上實際的開播時間；程式重啟後同一場直播會被視為新的一場。
 
 ---
 
