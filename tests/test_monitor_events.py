@@ -471,7 +471,7 @@ def test_failure_while_creator_still_live_earns_one_immediate_extra_poll(
     live_list_reads = []
     polled_again = ThreadEvent()
 
-    def read_live_list():
+    def read_live_list(creator_oids):
         live_list_reads.append(monotonic())
         if len(live_list_reads) > 1:
             polled_again.set()
@@ -714,7 +714,7 @@ def test_retry_enqueue_is_atomic_against_a_shutdown_landing_mid_request(
     """Test a shutdown cannot slip between the retry request's refusal check and its enqueue."""
     shutdown_flag_at_read = []
 
-    def read_live_list():
+    def read_live_list(creator_oids):
         shutdown_flag_at_read.append(monitor._shutdown_requested)
         return [_live_stream("creator1")]
 

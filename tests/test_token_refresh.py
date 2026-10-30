@@ -110,10 +110,10 @@ def test_custom_leeway_and_zero_expiry_boundary(api, clock):
     assert api._session.post.call_count == 2
 
 
-def test_public_status_does_not_acquire_or_renew_jwt(api):
-    api._session.get.return_value = response([])
-    assert api.get_livestream_status() == []
+def test_status_without_creators_does_not_acquire_jwt(api):
+    assert api.get_livestream_status([]) == []
     api._session.post.assert_not_called()
+    api._session.get.assert_not_called()
 
 
 @pytest.mark.parametrize("status", [401, 403])

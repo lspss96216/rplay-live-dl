@@ -39,70 +39,166 @@ def stub_get(api, **kwargs):
     return patch.object(api._session, "get", **kwargs)
 
 
+def status_response(status_code, body=None):
+    response = MagicMock()
+    response.status_code = status_code
+    response.json.return_value = body
+    return response
+
+
+LIVE_URLS = {
+    "mode": "signed",
+    "playUrls": {
+        "hd": "https://play.example/live/c1_abrhd.flv?sign=s&expire=1",
+        "sd": "https://play.example/live/c1_abrsd.flv?sign=s&expire=1",
+    },
+}
+OFFLINE_URLS = {"mode": None, "playUrls": None}
+METADATA = {
+    "_id": "stream-doc",
+    "oid": "stream-doc",
+    "creatorOid": "c1",
+    "title": "Test Stream",
+    "hashtags": ["tag"],
+    "isAdultContent": False,
+    # Masked without a browser pass; the client must not rely on it.
+    "streamState": "offline",
+    "streamStartTime": None,
+}
+
+
+def route(play_urls=OFFLINE_URLS, metadata=METADATA, play_status=200):
+    """GET stub dispatching on path, like the real API."""
+
+    def _get(url, **kwargs):
+        if url.endswith("/live/bytedance/play-urls"):
+            return status_response(play_status, play_urls)
+        if url.endswith("/live/play"):
+            return status_response(200, metadata)
+        raise AssertionError(f"unexpected GET {url}")
+
+    return _get
+
+
 class TestGetLivestreamStatus:
-    """Tests for get_livestream_status method."""
+    """Live detection via playback URLs, since the public list needs a browser check."""
 
     def test_uses_custom_base_url(self):
-        """Test livestream status uses the instance-level API base URL."""
         api = RPlayAPI(
             base_url="https://api.example.com/", user_oid="test", refresh_token="test"
         )
 
-        with stub_get(api, return_value=ok_response([])) as mock_get:
-            api.get_livestream_status()
+        with stub_get(api, side_effect=route()) as mock_get:
+            api.get_livestream_status(["c1"])
 
-        assert mock_get.call_args.args[0] == "https://api.example.com/live/livestreams"
+        assert (
+            mock_get.call_args.args[0]
+            == "https://api.example.com/live/bytedance/play-urls"
+        )
 
-    def test_successful_request(self, api):
-        """Test successful livestream status retrieval."""
-        body = [
-            {
-                "_id": "id1",
-                "oid": "oid1",
-                "creatorOid": "creator1",
-                "creatorNickname": "Test Creator",
-                "title": "Test Stream",
-                "streamStartTime": "2026-01-08T10:00:00Z",
-                "streamState": "live",
-            }
-        ]
-
-        with stub_get(api, return_value=ok_response(body)):
-            streams = api.get_livestream_status()
+    def test_live_creator_is_reported_with_metadata(self, api):
+        with stub_get(api, side_effect=route(LIVE_URLS)):
+            streams = api.get_livestream_status(["c1"])
 
         assert len(streams) == 1
-        assert streams[0].creator_nickname == "Test Creator"
+        assert streams[0].creator_oid == "c1"
+        assert streams[0].title == "Test Stream"
+        assert streams[0].oid == "stream-doc"
+        assert streams[0].stream_state.value == "live"
+
+    def test_offline_creator_is_not_reported_or_looked_up(self, api):
+        with stub_get(api, side_effect=route()) as mock_get:
+            assert api.get_livestream_status(["c1"]) == []
+
+        assert mock_get.call_count == 1
+
+    def test_start_time_is_stable_while_live(self, api):
+        with stub_get(api, side_effect=route(LIVE_URLS)):
+            first = api.get_livestream_status(["c1"])[0].stream_start_time
+            second = api.get_livestream_status(["c1"])[0].stream_start_time
+
+        assert first == second
+
+    def test_single_missed_poll_keeps_start_time(self, api):
+        with stub_get(api, side_effect=route(LIVE_URLS)):
+            first = api.get_livestream_status(["c1"])[0].stream_start_time
+        with stub_get(api, side_effect=route()):
+            api.get_livestream_status(["c1"])
+        with stub_get(api, side_effect=route(LIVE_URLS)):
+            again = api.get_livestream_status(["c1"])[0].stream_start_time
+
+        assert again == first
+
+    def test_confirmed_offline_starts_a_new_stream(self, api):
+        with stub_get(api, side_effect=route(LIVE_URLS)):
+            api.get_livestream_status(["c1"])
+        with stub_get(api, side_effect=route()):
+            api.get_livestream_status(["c1"])
+            api.get_livestream_status(["c1"])
+
+        assert "c1" not in api._live_since
+
+    def test_playback_denied_skips_creator_without_auth_error(self, api):
+        with stub_get(api, side_effect=route(play_status=403)):
+            assert api.get_livestream_status(["c1"]) == []
+
+    def test_unauthorized_raises_auth_error(self, api):
+        with stub_get(api, side_effect=route(play_status=401)):
+            with pytest.raises(RPlayAuthError):
+                api.get_livestream_status(["c1"])
 
     def test_timeout_raises_connection_error(self, api):
-        """Test that timeout raises RPlayConnectionError."""
-        with stub_get(api, side_effect=Timeout()):
+        with stub_get(api, side_effect=Timeout()), patch("time.sleep"):
             with pytest.raises(RPlayConnectionError, match="timed out"):
-                api.get_livestream_status()
+                api.get_livestream_status(["c1"])
 
     def test_connection_error_raises_connection_error(self, api):
-        """Test that connection errors raise RPlayConnectionError."""
-        with stub_get(api, side_effect=ConnectionError("Network unreachable")):
+        with stub_get(api, side_effect=ConnectionError("down")), patch("time.sleep"):
             with pytest.raises(RPlayConnectionError, match="Connection failed"):
-                api.get_livestream_status()
+                api.get_livestream_status(["c1"])
 
     def test_http_error_raises_api_error(self, api):
-        """Test that HTTP errors raise RPlayAPIError."""
-        mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = HTTPError("500 Server Error")
+        mock_response = status_response(400)
+        mock_response.raise_for_status.side_effect = HTTPError("400 Bad Request")
 
         with stub_get(api, return_value=mock_response):
             with pytest.raises(RPlayAPIError, match="HTTP error"):
-                api.get_livestream_status()
+                api.get_livestream_status(["c1"])
 
 
 class TestGetStreamUrl:
-    """Tests for get_stream_url method."""
+    """get_stream_url returns a fresh playback URL from play-urls."""
 
-    def test_url_encoding(self, api):
-        url = api.get_stream_url("creator123", stream_key="key+with/special=chars")
-        assert "key%2Bwith%2Fspecial%3Dchars" in url
-        assert "creatorOid=creator123" in url
-        assert "playlist.m3u8" in url
+    def test_signed_mode_returns_hd_url(self, api):
+        with stub_get(api, side_effect=route(LIVE_URLS)):
+            url = api.get_stream_url("c1")
+
+        assert url == LIVE_URLS["playUrls"]["hd"]
+
+    def test_falls_back_to_lower_quality(self, api):
+        urls = {"mode": "signed", "playUrls": {"hd": None, "sd": "https://p/sd.flv"}}
+        with stub_get(api, side_effect=route(urls)):
+            assert api.get_stream_url("c1") == "https://p/sd.flv"
+
+    def test_legacy_mode_appends_viewer_params(self, api):
+        api.auth_token = "jwt"
+        urls = {"mode": "legacy", "playUrls": {"hd": "https://p/live/c1.m3u8"}}
+        with stub_get(api, side_effect=route(urls)):
+            url = api.get_stream_url("c1")
+
+        assert url.startswith("https://p/live/c1.m3u8?")
+        assert "creatorId=c1" in url and "token=jwt" in url
+        assert url.endswith("&resolution=hd")
+
+    def test_not_live_raises_api_error(self, api):
+        with stub_get(api, side_effect=route()):
+            with pytest.raises(RPlayAPIError, match="not live"):
+                api.get_stream_url("c1")
+
+    def test_playback_denied_raises_api_error(self, api):
+        with stub_get(api, side_effect=route(play_status=403)):
+            with pytest.raises(RPlayAPIError, match="denied"):
+                api.get_stream_url("c1")
 
 
 class TestValidateCredentials:
@@ -207,12 +303,12 @@ class TestTransientRetry:
                 side_effect=[
                     ConnectionError("boom"),
                     ConnectionError("boom"),
-                    ok_response([]),
+                    status_response(200, OFFLINE_URLS),
                 ],
             ) as mock_get,
             patch("time.sleep") as mock_sleep,
         ):
-            streams = api.get_livestream_status()
+            streams = api.get_livestream_status(["c1"])
 
         assert streams == []
         assert mock_get.call_count == 3

@@ -1065,3 +1065,101 @@ class TestDownloadErrorCallback:
         assert isinstance(events[0], RawDownloadFailed)
         assert events[0].session_key == "creator1:2026-03-06T12:00:00"
         assert events[0].error_message == "Unexpected error"
+
+
+class TestStreamUrlResolver:
+    """Expiring playback URLs: each retry gets a fresh URL and its own fragment."""
+
+    def test_ts_output_records_through_ffmpeg_as_mpegts(self, tmp_path):
+        options = StreamDownloader(
+            "TestCreator", output_extension=".ts"
+        )._build_ydl_options(tmp_path / "test.ts")
+
+        assert options["external_downloader"] == {"default": "ffmpeg"}
+        assert options["external_downloader_args"]["ffmpeg_o"] == ["-f", "mpegts"]
+
+    def test_retry_resolves_fresh_url_into_new_fragment(
+        self, mock_ydl, mock_sleep, completed_events, tmp_path
+    ):
+        resolver = MagicMock(return_value="https://fresh.example/stream.flv")
+        downloader = StreamDownloader(
+            "TestCreator",
+            session_key="creator1:stream1",
+            on_download_complete=completed_events.append,
+            stream_url_resolver=resolver,
+        )
+        output_path = tmp_path / "test.ts"
+        first_part = Path(f"{output_path}.part")
+
+        def die_mid_recording(urls):
+            first_part.write_bytes(b"first")
+            raise yt_dlp.utils.DownloadError("ERROR: ffmpeg exited with code 1")
+
+        def finish(urls):
+            (tmp_path / "test_r01.ts").write_bytes(b"second")
+
+        attempts = iter([die_mid_recording, finish])
+        mock_ydl.download.side_effect = lambda urls: next(attempts)(urls)
+
+        with patch("core.downloader.yt_dlp.YoutubeDL") as ydl_class:
+            ydl_class.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+            ydl_class.return_value.__exit__ = MagicMock(return_value=False)
+            _run_worker(downloader, output_path)
+            outtmpls = [call.args[0].get("outtmpl") for call in ydl_class.call_args_list]
+
+        assert [call.args[0] for call in mock_ydl.download.call_args_list] == [
+            [STREAM_URL],
+            ["https://fresh.example/stream.flv"],
+        ]
+        assert outtmpls == [None, str(tmp_path / "test_r01.ts")]
+        # The first attempt's partial recording is kept, not overwritten.
+        assert output_path.read_bytes() == b"first"
+        assert len(completed_events) == 1
+
+    def test_resolver_failure_ends_recording_with_existing_footage(
+        self, mock_ydl, mock_sleep, completed_events, failed_events, tmp_path
+    ):
+        downloader = StreamDownloader(
+            "TestCreator",
+            session_key="creator1:stream1",
+            on_download_complete=completed_events.append,
+            on_download_failure=failed_events.append,
+            stream_url_resolver=MagicMock(side_effect=RuntimeError("not live")),
+        )
+        output_path = tmp_path / "test.ts"
+
+        def die_after_recording(urls):
+            Path(f"{output_path}.part").write_bytes(b"footage")
+            raise yt_dlp.utils.DownloadError("ERROR: ffmpeg exited with code 1")
+
+        mock_ydl.download.side_effect = die_after_recording
+
+        _run_worker(downloader, output_path)
+
+        assert mock_ydl.download.call_count == 1
+        assert output_path.read_bytes() == b"footage"
+        assert len(completed_events) == 1
+        assert failed_events == []
+
+    def test_retry_fragments_sort_after_first_output(self):
+        base = Path("20260101_000000_#C 2026-01-01 t.ts")
+        names = [
+            StreamDownloader._retry_fragment_path(base, n).name for n in (1, 2, 11)
+        ]
+
+        assert names == sorted(names)
+        assert names[0] == base.name
+
+    def test_hls_only_input_options_are_dropped_for_flv(self, tmp_path):
+        options = StreamDownloader("TestCreator", output_extension=".ts")._build_ydl_options(
+            tmp_path / "test.ts"
+        )
+
+        flv = StreamDownloader._options_for_url(options, "https://p/live/c_abrhd.flv?sign=s")
+        hls = StreamDownloader._options_for_url(options, "https://p/live/playlist.m3u8?k=v")
+
+        assert "-seg_max_retry" not in flv["external_downloader_args"]["ffmpeg_i"]
+        assert "-reconnect" in flv["external_downloader_args"]["ffmpeg_i"]
+        assert "-seg_max_retry" in hls["external_downloader_args"]["ffmpeg_i"]
+        # The shared options are not mutated for later attempts.
+        assert "-seg_max_retry" in options["external_downloader_args"]["ffmpeg_i"]

@@ -20,7 +20,7 @@ from models.download import MergeCompleted, MergeJobSpec
 
 
 def test_recording_survives_refresh_boundary(tmp_path, monkeypatch):
-    """Refresh during an active HLS download, merge it, and acquire another key."""
+    """Refresh during an active download, merge it, and acquire another key."""
     if not shutil.which("ffmpeg"):
         pytest.skip("FFmpeg is required for the real media integration test")
     monkeypatch.chdir(tmp_path)
@@ -91,8 +91,15 @@ def test_recording_survives_refresh_boundary(tmp_path, monkeypatch):
                 key_tokens.append(token)
                 assert token == refreshes[-1]
                 self.respond(b'{"authKey":"synthetic-key"}')
+            elif parsed.path == "/live/bytedance/play-urls":
+                query = parse_qs(parsed.query)
+                assert query["creatorId"] == ["fixture"]
+                assert query["token"] == [refreshes[-1]]
+                playlist = f"http://127.0.0.1:{self.server.server_port}/fixture.m3u8"
+                self.respond(
+                    json.dumps({"mode": "signed", "playUrls": {"hd": playlist}}).encode()
+                )
             elif parsed.path.endswith(".m3u8"):
-                assert parse_qs(parsed.query)["key2"] == ["synthetic-key"]
                 self.respond(
                     b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
                     b"#EXTINF:1.0,\n/segment.ts\n#EXT-X-ENDLIST\n",

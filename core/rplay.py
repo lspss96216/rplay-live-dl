@@ -4,7 +4,8 @@ import base64
 import json
 import math
 import time
-from typing import Callable, List
+from datetime import datetime, timezone
+from typing import Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -47,6 +48,10 @@ class RPlayConnectionError(RPlayAPIError):
     pass
 
 
+class _PlaybackDeniedError(Exception):
+    """play-urls refused this viewer (403): likely paid or private, not bad credentials."""
+
+
 class _RetryableStatusCodeError(Exception):
     """Internal exception used to retry transient HTTP status codes."""
 
@@ -73,6 +78,10 @@ class RPlayAPI:
         self.headers = DEFAULT_HTTP_HEADERS.copy()
         self.logger = setup_logger("RPlayAPI")
         self._session = requests.Session()
+        # /live/livestreams and /live/play hide live state behind a browser
+        # check, so the start time is when this client first saw playback URLs.
+        self._live_since: Dict[str, datetime] = {}
+        self._offline_polls: Dict[str, int] = {}
 
     def set_base_url(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -114,66 +123,175 @@ class RPlayAPI:
 
         return _callback
 
-    def get_livestream_status(self) -> List[LiveStream]:
-        """Raises RPlayAuthError on 401/403 and RPlayConnectionError on timeout or lost connection."""
-        url = f"{self.base_url}/live/livestreams"
+    # Polls without playback URLs before a creator's first-seen time is dropped,
+    # matching the monitor's offline confirmation so one blip keeps the session.
+    OFFLINE_CONFIRMATION_POLLS = 2
 
+    def get_livestream_status(self, creator_oids: Iterable[str]) -> List[LiveStream]:
+        """Live streams among creator_oids.
+
+        Raises RPlayAuthError on 401 and RPlayConnectionError on timeout or lost connection.
+        """
         try:
-            return self._build_retrying("Fetching livestream status")(
-                self._request_livestream_status
-            )
+            streams = []
+            for creator_oid in creator_oids:
+                stream = self._check_creator_live(creator_oid)
+                if stream is not None:
+                    streams.append(stream)
+            return streams
 
         except requests.exceptions.Timeout:
-            self.logger.error(f"Timeout while fetching livestream status from {url}")
+            self.logger.error("Timeout while fetching livestream status")
             raise RPlayConnectionError("Request timed out")
 
-        except requests.exceptions.ConnectionError as exc:
-            self.logger.error(
-                f"Connection error while fetching livestream status: {exc}"
-            )
-            raise RPlayConnectionError(f"Connection failed: {exc}")
+        except requests.exceptions.ConnectionError:
+            self.logger.error("Connection error while fetching livestream status")
+            raise RPlayConnectionError("Connection failed")
 
         except _RetryableStatusCodeError as exc:
             self.logger.error(f"HTTP error while fetching livestream status: {exc}")
             raise RPlayAPIError(f"HTTP error: {exc}")
 
         except requests.exceptions.HTTPError as exc:
-            self.logger.error(f"HTTP error while fetching livestream status: {exc}")
-            raise RPlayAPIError(f"HTTP error: {exc}")
+            status = exc.response.status_code if exc.response is not None else "error"
+            self.logger.error(f"HTTP error while fetching livestream status: {status}")
+            raise RPlayAPIError(f"HTTP error: {status}")
 
-        except RPlayAuthError:
+        except RPlayAPIError:
             raise
 
         except Exception as exc:
-            self.logger.exception(
-                f"Unexpected error while fetching livestream status: {exc}"
+            # Message suppressed on purpose: play-urls requests carry the JWT.
+            self.logger.error(
+                f"Unexpected error while fetching livestream status: {type(exc).__name__}"
             )
-            raise RPlayAPIError(f"Unexpected error: {exc}")
+            raise RPlayAPIError(f"Unexpected error: {type(exc).__name__}")
 
-    def _request_livestream_status(self) -> List[LiveStream]:
+    def _check_creator_live(self, creator_oid: str) -> Optional[LiveStream]:
+        try:
+            play_urls = self._build_retrying("Fetching playback URLs")(
+                self._request_play_urls, creator_oid
+            )
+        except _PlaybackDeniedError:
+            self.logger.warning(
+                f"Playback denied for creator {creator_oid} (paid or private stream?)"
+            )
+            play_urls = None
+
+        if play_urls is None:
+            misses = self._offline_polls.get(creator_oid, 0) + 1
+            if misses >= self.OFFLINE_CONFIRMATION_POLLS:
+                self._live_since.pop(creator_oid, None)
+                self._offline_polls.pop(creator_oid, None)
+            else:
+                self._offline_polls[creator_oid] = misses
+            return None
+
+        self._offline_polls.pop(creator_oid, None)
+        started_at = self._live_since.setdefault(
+            creator_oid, datetime.now(timezone.utc).replace(microsecond=0)
+        )
+        metadata = self._build_retrying("Fetching stream metadata")(
+            self._request_play_metadata, creator_oid
+        )
+        stream_oid = metadata.get("oid") or metadata.get("_id") or creator_oid
+        return LiveStream(
+            _id=metadata.get("_id") or stream_oid,
+            oid=stream_oid,
+            creatorOid=creator_oid,
+            creatorNickname=metadata.get("creatorNickname") or creator_oid,
+            title=metadata.get("title") or "",
+            description=metadata.get("description"),
+            hashtags=metadata.get("hashtags") or [],
+            isAdultContent=bool(metadata.get("isAdultContent")),
+            streamStartTime=started_at,
+            streamState="live",
+        )
+
+    def _request_play_urls(self, creator_oid: str) -> Optional[Dict]:
+        """The website's playback-auth call: URLs while live, null otherwise."""
+        self._ensure_valid_token()
         response = self._session.get(
-            f"{self.base_url}/live/livestreams",
+            f"{self.base_url}/live/bytedance/play-urls",
+            params={
+                "creatorId": creator_oid,
+                "userId": self.user_oid,
+                "token": self.auth_token,
+                "key": "",
+                "watching": "0",
+            },
             headers=self.headers,
             timeout=DEFAULT_REQUEST_TIMEOUT,
         )
-        if response.status_code in (401, 403):
-            raise RPlayAuthError(
-                "Authentication failed while fetching livestream status"
-            )
+        if response.status_code == 401:
+            raise RPlayAuthError("Authentication failed while fetching playback URLs")
+        if response.status_code == 403:
+            raise _PlaybackDeniedError()
         if response.status_code in RETRY_STATUS_CODES:
             raise _RetryableStatusCodeError(response.status_code)
         response.raise_for_status()
-        return [LiveStream(**stream) for stream in response.json()]
+        data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("playUrls"), dict):
+            return None
+        return data
 
-    def get_stream_url(self, creator_oid: str, stream_key: str) -> str:
-        params = urlencode(
-            {
-                "creatorOid": creator_oid,
-                "key2": stream_key,
-            }
+    def _request_play_metadata(self, creator_oid: str) -> Dict:
+        response = self._session.get(
+            f"{self.base_url}/live/play",
+            params={"creatorOid": creator_oid, "withoutLiveState": "true"},
+            headers=self.headers,
+            timeout=DEFAULT_REQUEST_TIMEOUT,
         )
+        if response.status_code in RETRY_STATUS_CODES:
+            raise _RetryableStatusCodeError(response.status_code)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RPlayAPIError("Invalid stream metadata response")
+        return data
 
-        return f"{self.base_url}/live/stream/playlist.m3u8?{params}"
+    def get_stream_url(self, creator_oid: str, stream_key: str = "") -> str:
+        """Fresh playback URL. Signed URLs expire within minutes, so call per attempt.
+
+        stream_key is accepted for callers that still fetch key2; playback no longer uses it.
+        """
+        try:
+            data = self._build_retrying("Fetching playback URLs")(
+                self._request_play_urls, creator_oid
+            )
+        except _PlaybackDeniedError:
+            raise RPlayAPIError("Playback denied (paid or private stream?)") from None
+        except _RetryableStatusCodeError as exc:
+            raise RPlayAPIError(f"Failed to get playback URL: {exc}") from None
+        except requests.exceptions.Timeout:
+            raise RPlayConnectionError(
+                "Request timed out while getting playback URL"
+            ) from None
+        except requests.exceptions.ConnectionError:
+            raise RPlayConnectionError(
+                "Connection failed while getting playback URL"
+            ) from None
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "error"
+            raise RPlayAPIError(f"Failed to get playback URL: HTTP {status}") from None
+        if data is None:
+            raise RPlayAPIError("No playback URL: stream is not live")
+
+        urls = data["playUrls"]
+        base = next((urls[q] for q in ("hd", "sd", "ld") if urls.get(q)), None)
+        if not isinstance(base, str):
+            raise RPlayAPIError("No playback URL in response")
+        if data.get("mode") == "legacy":
+            # Same shape the website builds for legacy (non-BytePlus) streams.
+            params = urlencode(
+                {
+                    "creatorId": creator_oid,
+                    "userId": self.user_oid,
+                    "token": self.auth_token,
+                }
+            )
+            return f"{base}?{params}&resolution=hd"
+        return base
 
     def validate_credentials(self) -> None:
         """Check REFRESH_TOKEN and USER_OID by fetching one stream key."""
