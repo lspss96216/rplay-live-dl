@@ -278,7 +278,9 @@ class RPlayAPI:
             raise RPlayAPIError("No playback URL: stream is not live")
 
         urls = data["playUrls"]
-        base = next((urls[q] for q in ("hd", "sd", "ld") if urls.get(q)), None)
+        # "ud" (1080p) is only returned once the viewer has unlocked it for this
+        # creator on the website; otherwise hd (720p) is the best offered.
+        base = next((urls[q] for q in ("ud", "hd", "sd", "ld") if urls.get(q)), None)
         if not isinstance(base, str):
             raise RPlayAPIError("No playback URL in response")
         if data.get("mode") == "legacy":

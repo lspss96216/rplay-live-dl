@@ -66,7 +66,7 @@ RPlay 改了兩件事，讓原版失效：
 | --- | --- |
 | `core/rplay.py` | **偵測開台**：不再讀全站清單，改成對設定中的每位實況主，用帳號 JWT 呼叫 `/live/bytedance/play-urls`，有播放網址就視為開台；標題從 `/live/play` 取得。`get_livestream_status()` 改為接收要檢查的 creator ID 清單。 |
 | `core/rplay.py` | **開播時間**：新介面不提供開播時間，改用程式「第一次看到開台」的時間；連續 2 次檢查沒看到才清除，偶爾一次查不到不會被當成新的一場。 |
-| `core/rplay.py` | **播放網址**：`get_stream_url()` 每次呼叫都向 play-urls 取得最新網址（優先 `hd`，依序退回 `sd`/`ld`）；舊式（legacy）串流則照網站前端的格式組出網址。回應 403（付費或私人直播）時只略過該實況主，不會讓整輪檢查失敗。 |
+| `core/rplay.py` | **播放網址**：`get_stream_url()` 每次呼叫都向 play-urls 取得最新網址（優先 `ud` 1080p，需先在網站上對該實況主解鎖；否則依序 `hd`/`sd`/`ld`）；舊式（legacy）串流則照網站前端的格式組出網址。回應 403（付費或私人直播）時只略過該實況主，不會讓整輪檢查失敗。 |
 | `core/downloader.py` | **錄影**：輸出 `.ts` 時強制用 ffmpeg 錄成 MPEG-TS，FLV 輸入也能沿用原本的合併與孤兒救援流程。 |
 | `core/downloader.py` | **ffmpeg 參數**：非 HLS 的輸入會移除只適用 HLS 的 `-seg_max_retry`，否則 ffmpeg 會直接以 code 8 結束。 |
 | `core/downloader.py` | **斷線重試**：每次重試都重新取得播放網址，並寫進新的分段檔（`…_r01.ts`、`…_r02.ts`），合併時依序接起來。原版重試會覆蓋前一次錄到的內容。如果重試時已取不到網址（通常代表關台），就用已錄到的內容結束並合併。 |

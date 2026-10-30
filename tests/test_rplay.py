@@ -175,6 +175,14 @@ class TestGetStreamUrl:
 
         assert url == LIVE_URLS["playUrls"]["hd"]
 
+    def test_prefers_unlocked_1080p(self, api):
+        urls = {
+            "mode": "signed",
+            "playUrls": {**LIVE_URLS["playUrls"], "ud": "https://p/c1_abrud.flv?sign=s"},
+        }
+        with stub_get(api, side_effect=route(urls)):
+            assert api.get_stream_url("c1") == "https://p/c1_abrud.flv?sign=s"
+
     def test_falls_back_to_lower_quality(self, api):
         urls = {"mode": "signed", "playUrls": {"hd": None, "sd": "https://p/sd.flv"}}
         with stub_get(api, side_effect=route(urls)):
