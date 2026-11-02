@@ -7,7 +7,8 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import yt_dlp
 import yt_dlp.utils
@@ -118,8 +119,13 @@ class StreamDownloader:
         filename_prefix: str = "",
         on_download_complete: Optional[Callable[[RawDownloadCompleted], None]] = None,
         on_download_failure: Optional[Callable[[RawDownloadFailed], None]] = None,
+        stream_url_resolver: Optional[Callable[[], str]] = None,
     ) -> None:
-        """on_download_error is called from the download thread."""
+        """on_download_error is called from the download thread.
+
+        stream_url_resolver, when set, supplies a fresh URL for every retry and
+        each retry records to its own fragment, so earlier footage is kept.
+        """
         self.creator_name = creator_name
         self.logger = setup_logger("Downloader")
         self.log = bind(self.logger, creator_name)
@@ -136,6 +142,8 @@ class StreamDownloader:
         self._on_download_complete = on_download_complete
         self._on_download_failure = on_download_failure
         self._last_download_attempt = 0
+        self._stream_url_resolver = stream_url_resolver
+        self._attempt_output_path: Optional[Path] = None
         self._yt_dlp_logger = _YtDlpLoggerBridge(
             self,
             enabled=is_ytdlp_internal_logging_enabled(),
@@ -243,6 +251,12 @@ class StreamDownloader:
             },
         }
 
+        if self.output_extension == ".ts":
+            # Playback URLs may be live FLV. Recording through ffmpeg as MPEG-TS
+            # keeps the raw file truncation-safe, like HLS, for merge and recovery.
+            options["external_downloader"] = {"default": "ffmpeg"}
+            options["external_downloader_args"]["ffmpeg_o"] = ["-f", "mpegts"]
+
         if self.output_extension == ".mp4":
             options["merge_output_format"] = "mp4"
 
@@ -279,6 +293,38 @@ class StreamDownloader:
             counter += 1
             if counter > cls.MAX_DUPLICATE_FILES:
                 raise RuntimeError(f"Too many duplicate files for {base_path.stem}")
+
+    # HLS demuxer options. ffmpeg rejects them for other inputs (FLV) and exits 8.
+    _HLS_ONLY_FFMPEG_INPUT_OPTIONS = {"-seg_max_retry"}
+
+    @classmethod
+    def _options_for_url(cls, ydl_opts: Dict[str, Any], url: str) -> Dict[str, Any]:
+        input_args = ydl_opts.get("external_downloader_args", {}).get("ffmpeg_i")
+        if not input_args or ".m3u8" in urlsplit(url).path:
+            return ydl_opts
+        kept: List[str] = []
+        args = iter(input_args)
+        for arg in args:
+            if arg in cls._HLS_ONLY_FFMPEG_INPUT_OPTIONS:
+                next(args, None)
+                continue
+            kept.append(arg)
+        return {
+            **ydl_opts,
+            "external_downloader_args": {
+                **ydl_opts["external_downloader_args"],
+                "ffmpeg_i": kept,
+            },
+        }
+
+    @staticmethod
+    def _retry_fragment_path(output_path: Path, attempt_number: int) -> Path:
+        """Zero-padded so the merge's sorted glob keeps attempts in order."""
+        if attempt_number <= 1:
+            return output_path
+        return output_path.with_name(
+            f"{output_path.stem}_r{attempt_number - 1:02d}{output_path.suffix}"
+        )
 
     @staticmethod
     def _has_sibling_fragment_outputs(output_path: Path) -> bool:
@@ -426,6 +472,8 @@ class StreamDownloader:
                 # Classifying it as blocked or retryable would drop the session and
                 # orphan the raw output already on disk.
                 session_prefix = (self.filename_prefix or "").rstrip("_")
+                if self._attempt_output_path not in (None, output_path):
+                    self._adopt_part_output(self._attempt_output_path)
                 if output_path.exists() or self._has_sibling_fragment_outputs(
                     output_path
                 ):
@@ -583,12 +631,35 @@ class StreamDownloader:
                             f"output={output_path.name}, "
                             f"{self._build_output_state_details(output_path)}",
                         )
+                    attempt_url = stream_url
+                    attempt_opts = ydl_opts
+                    attempt_path = output_path
+                    if self._stream_url_resolver is not None and attempt_number > 1:
+                        # The previous attempt's ffmpeg died mid-recording; keep
+                        # its .part as a raw fragment instead of overwriting it.
+                        if self._attempt_output_path is not None:
+                            self._adopt_part_output(self._attempt_output_path)
+                        try:
+                            attempt_url = self._stream_url_resolver()
+                        except Exception as exc:
+                            # No URL usually means the stream ended: finish with
+                            # the fragments already recorded.
+                            self.log.info(
+                                f"⏹️ Stream no longer available, ending recording: {exc}",
+                            )
+                            return
+                        attempt_path = self._retry_fragment_path(
+                            output_path, attempt_number
+                        )
+                        attempt_opts = {**ydl_opts, "outtmpl": str(attempt_path)}
+                    self._attempt_output_path = attempt_path
+                    attempt_opts = self._options_for_url(attempt_opts, attempt_url)
                     try:
                         # yt-dlp accepts these, but its stubs are narrower.
                         with yt_dlp.YoutubeDL(
-                            ydl_opts,  # pyright: ignore[reportArgumentType]
+                            attempt_opts,  # pyright: ignore[reportArgumentType]
                         ) as ydl:
-                            ydl.download([stream_url])
+                            ydl.download([attempt_url])
                     except yt_dlp.utils.DownloadError as exc:
                         error_message = str(exc)
                         if self._is_auth_error(error_message):

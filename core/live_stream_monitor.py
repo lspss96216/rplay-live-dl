@@ -341,7 +341,9 @@ class LiveStreamMonitor:
         self._cycle_key_fetch_auth_failed = False
         try:
             self._update_downloaders()
-            live_streams = self.api_client.get_livestream_status()
+            with self._state_lock:
+                creator_oids = list(self.monitored_creators)
+            live_streams = self.api_client.get_livestream_status(creator_oids)
             # Recorded before any download starts, so a session that fails fast
             # is judged against the list this very poll read.
             with self._state_lock:
@@ -603,6 +605,10 @@ class LiveStreamMonitor:
                 session=session,
                 stream_url=stream_url,
                 title=stream.title,
+                # Signed playback URLs expire within minutes; retries need a new one.
+                stream_url_resolver=lambda: self.api_client.get_stream_url(
+                    creator_oid, stream_key=stream_key
+                ),
             )
         except Exception as exc:
             self._handle_start_download_error(session.session_key, creator_name, exc)
@@ -612,9 +618,11 @@ class LiveStreamMonitor:
         session: DownloadSession,
         stream_url: str,
         title: str,
+        stream_url_resolver: Optional[Callable[[], str]] = None,
     ) -> None:
         active_downloader = StreamDownloader(
             creator_name=session.creator_name,
+            stream_url_resolver=stream_url_resolver,
             on_download_error=self._make_session_download_error_callback(
                 session.session_key
             ),
