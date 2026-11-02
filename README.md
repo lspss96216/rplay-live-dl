@@ -71,16 +71,55 @@ RPlay 改了兩件事，讓原版失效：
 | `core/downloader.py` | **ffmpeg 參數**：非 HLS 的輸入會移除只適用 HLS 的 `-seg_max_retry`，否則 ffmpeg 會直接以 code 8 結束。 |
 | `core/downloader.py` | **斷線重試**：每次重試都重新取得播放網址，並寫進新的分段檔（`…_r01.ts`、`…_r02.ts`），合併時依序接起來。原版重試會覆蓋前一次錄到的內容。如果重試時已取不到網址（通常代表關台），就用已錄到的內容結束並合併。 |
 | `core/live_stream_monitor.py` | 傳入要檢查的實況主清單，並把「重新取得網址」的函式交給下載器，供重試使用。 |
+| `scripts/record_m3u8.sh` | **手動錄影**：新增。給無法自動偵測的 Amazon IVS 串流使用，貼上從瀏覽器取得的 m3u8 網址即可錄影、斷線重連、結束後合併成 MP4，詳見下方「手動錄影」。 |
 | `tests/` | 依新介面改寫狀態與網址相關測試，並新增重試分段、網址重取、ffmpeg 參數過濾的測試，共 534 個測試通過。 |
 
 ### 驗證
 
 已在真實的 BytePlus 直播上端對端測試：程式自動偵測到開台、自動開始錄影，連續錄約 4 分鐘（跨過網址的 180 秒效期也沒有中斷），停止後自動合併成可完整解碼的 MP4（1280×720，標題與實況主資訊已寫入檔案）。
 
+### 手動錄影：無法自動偵測的串流（Amazon IVS）
+
+RPlay 上的直播有三種來源，網站播放器依序嘗試：
+
+| 串流 | 播放網址來源 | 本程式 |
+| --- | --- | --- |
+| BytePlus | `/live/bytedance/play-urls` 回傳 `mode: "signed"` | ✅ 自動偵測、自動錄影 |
+| RPlay 自家伺服器（legacy） | `/live/bytedance/play-urls` 回傳 `mode: "legacy"` | ✅ 自動偵測（尚未在真實直播上驗證） |
+| Amazon IVS | 只放在 `/live/play` 的 `playUrl` | ❌ 偵測不到 |
+
+IVS 串流的開台狀態與播放網址只存在於受瀏覽器驗證保護的 `/live/play`，程式拿到的永遠是 `offline` 和空網址，所以無法自動偵測。本 fork 不會嘗試繞過這個驗證，改提供手動錄影腳本：由你在自己的瀏覽器取得 m3u8 網址，再交給腳本錄影。
+
+可以用 `/live/play?creatorOid=<id>&withoutLiveState=true` 回傳的 `useBytePlusStream` 判斷實況主是不是 BytePlus；不是 BytePlus、play-urls 又沒有回傳網址的，多半就是 IVS。
+
+**1. 取得 m3u8 網址**（電腦版 Chrome / Edge）
+
+1. 打開實況主的直播頁，確認正在播放。
+2. 按 `F12` 打開開發者工具，切到 **Network** 分頁，篩選欄輸入 `m3u8`。清單是空的就按 `F5` 重新整理。
+3. 選網域為 `playlist.live-video.net` 的項目。若有多筆，在 **Response** 裡含多行 `#EXT-X-STREAM-INF` 的是主清單，選它可以錄到最高畫質。
+4. 按右鍵 → **Copy** → **Copy URL**。
+
+**2. 開始錄影**
+
+```bash
+scripts/record_m3u8.sh                    # 執行後貼上網址
+scripts/record_m3u8.sh '<m3u8 網址>' お子  # 或直接帶參數，第二個參數是存放的資料夾名稱
+```
+
+- 需要 `ffmpeg` 與 `ffprobe` 在 `PATH` 上。長時間錄影建議放在 `tmux` 或 `screen` 裡執行。
+- 影片寫到 `archive/<名稱>/`。錄影中是隱藏的 `.ts` 分段，直播結束（或按 `Ctrl+C`）後會合併成 `archive/<名稱>/<名稱> <時間>.mp4`，合併完成前不會出現可見的 `.mp4`。
+- 斷線會自動重連並寫成新的分段，最後依序合併。連續 3 次在 15 秒內失敗，視為直播結束或網址過期，用已錄到的內容收尾。
+- 網址每場都不同，可能帶有效期限；錄到一半失效但直播還在播時，重新抓一次網址再執行即可。
+- 網址不會寫進 log（`logs/record_m3u8.log`）。
+- 環境變數：`ARCHIVE_DIR`（預設 `archive`）、`DEFAULT_CREATOR`（預設 `manual`）、`RECORD_HOOK`（結束時執行的指令，參數為 `saved <mp4> <分段數>`、`merge_failed <名稱> <資料夾>` 或 `nothing <名稱>`，可用來接自己的通知或上傳流程）。
+
+已在真實的 IVS 直播上測試：從伺服器錄完整場約 25 分鐘，沒有中斷，輸出 1280×720 60fps、含 AAC 音訊的 MP4。
+
 ### 限制
 
 - 偵測方式是逐一詢問每位實況主的播放網址，每輪檢查的請求數會隨監控人數增加。這是在避開 RPlay 對清單 API 的瀏覽器檢查；如果 RPlay 之後對 play-urls 也加上限制，就需要再調整。
-- 舊式（legacy，非 BytePlus）串流的網址格式是依網站前端程式碼實作的，尚未在真實的舊式直播上驗證。
+- RPlay 自家伺服器（legacy）串流的網址格式是依網站前端程式碼實作的，尚未在真實的直播上驗證。
+- Amazon IVS 串流無法自動偵測，只能用上面的手動錄影腳本，從開台到貼上網址之間的內容會錄不到。
 - 開播時間是本機第一次偵測到的時間，不是 RPlay 上實際的開播時間；程式重啟後同一場直播會被視為新的一場。
 
 ---
