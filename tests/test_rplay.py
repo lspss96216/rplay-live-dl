@@ -9,6 +9,7 @@ from core.rplay import (
     RPlayAPI,
     RPlayAPIError,
     RPlayAuthError,
+    RPlayBrowserCheckError,
     RPlayConnectionError,
 )
 from models.rplay import CreatorStreamState
@@ -141,6 +142,16 @@ class TestGetLivestreamStatus:
     def test_playback_denied_skips_creator_without_auth_error(self, api):
         with stub_get(api, side_effect=route(play_status=403)):
             assert api.get_livestream_status(["c1"]) == []
+
+    def test_browser_check_fails_the_poll_instead_of_skipping(self, api):
+        gated = status_response(403, {"code": "BROWSER_CHECK_REQUIRED"})
+        gated.headers = {"x-browser-check": "required"}
+        with stub_get(api, return_value=gated) as mock_get:
+            with pytest.raises(RPlayBrowserCheckError):
+                api.get_livestream_status(["c1", "c2"])
+
+        # Not retried, and the second creator is not asked.
+        assert mock_get.call_count == 1
 
     def test_unauthorized_raises_auth_error(self, api):
         with stub_get(api, side_effect=route(play_status=401)):

@@ -12,6 +12,7 @@ class NotificationKind(StrEnum):
     OFFLINE = "offline"
     BLOCKED = "blocked"
     AUTH_FAILED = "auth_failed"
+    BROWSER_CHECK = "browser_check"
     DOWNLOAD_FAILED = "download_failed"
     MERGE_FAILED = "merge_failed"
     MERGE_COMPLETED = "merge_completed"

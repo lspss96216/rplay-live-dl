@@ -43,6 +43,13 @@ _CARD_COPY = {
         0xEF4444,
         action="Update `REFRESH_TOKEN`, check `USER_OID`, and restart with the updated settings.",
     ),
+    NotificationKind.BROWSER_CHECK: _CardCopy(
+        "Live detection blocked",
+        0xF97316,
+        description="RPlay now requires a browser check for playback URLs.",
+        action="Automatic detection cannot work until this changes. "
+        "Record manually with `scripts/record_m3u8.sh`.",
+    ),
     NotificationKind.DOWNLOAD_FAILED: _CardCopy(
         "Recording retries delayed",
         0x3B82F6,

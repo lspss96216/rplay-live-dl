@@ -48,7 +48,13 @@ from .logger import bind, clip, setup_logger
 from .notifications import INSUFFICIENT_SPACE_DETAIL, DiscordNotifier
 from .orphan_recovery import install_merge_output_without_overwrite
 from .recording_metadata import recording_metadata, utc_timestamp
-from .rplay import RPlayAPI, RPlayAPIError, RPlayAuthError, RPlayConnectionError
+from .rplay import (
+    RPlayAPI,
+    RPlayAPIError,
+    RPlayAuthError,
+    RPlayBrowserCheckError,
+    RPlayConnectionError,
+)
 from .utils import (
     fit_filename_component_bytes,
     format_merge_failure,
@@ -192,6 +198,7 @@ class LiveStreamMonitor:
         self._monitored_count = 0
         self._last_status: Dict[str, int] = {"active_downloads": 0, "monitored_live": 0}
         self._auth_error_notified = False
+        self._browser_check_notified = False
         # Per cycle only, no TTL: key2 is user-scoped, not creator-scoped.
         self._cycle_stream_key: Optional[str] = None
         self._cycle_key_fetch_auth_failed = False
@@ -373,6 +380,9 @@ class LiveStreamMonitor:
         except RPlayConnectionError as exc:
             self.logger.warning(f"Connection error (will retry): {exc}")
             self._mark_check_failed()
+        except RPlayBrowserCheckError as exc:
+            self._log_browser_check(f"Live detection blocked: {exc}")
+            self._mark_check_failed()
         except RPlayAPIError as exc:
             self.logger.error(f"API error: {exc}")
             self._mark_check_failed()
@@ -389,6 +399,8 @@ class LiveStreamMonitor:
                     self.logger.warning(f"Failed to write heartbeat file: {exc}")
 
     def _mark_check_succeeded(self) -> None:
+        # A clean poll re-arms the browser-check notification.
+        self._browser_check_notified = False
         with self._state_lock:
             self._last_check_success = True
 
@@ -1074,6 +1086,14 @@ class LiveStreamMonitor:
             self.notifier.notify(Notification(NotificationKind.AUTH_FAILED))
         log = self.logger.debug if self._auth_error_notified else self.logger.error
         self._auth_error_notified = True
+        log(message)
+
+    def _log_browser_check(self, message: str) -> None:
+        """Notify and log once per blocked streak; repeats go to DEBUG."""
+        if not self._browser_check_notified:
+            self.notifier.notify(Notification(NotificationKind.BROWSER_CHECK))
+        log = self.logger.debug if self._browser_check_notified else self.logger.error
+        self._browser_check_notified = True
         log(message)
 
     def _handle_raw_download_failed(self, event: RawDownloadFailed) -> None:

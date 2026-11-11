@@ -64,6 +64,7 @@ def test_embed_redacts_secrets_disables_mentions_and_bounds_emoji(monkeypatch):
         ("offline", 0x64748B),
         ("blocked", 0xF59E0B),
         ("auth_failed", 0xEF4444),
+        ("browser_check", 0xF97316),
         ("download_failed", 0x3B82F6),
         ("merge_failed", 0xA855F7),
         ("disk_warning", 0xEAB308),
@@ -300,6 +301,7 @@ def test_retired_recovery_filter_is_ignored_and_merge_completion_defaults_on():
     [
         "blocked",
         "auth_failed",
+        "browser_check",
         "download_failed",
         "merge_failed",
         "merge_completed",

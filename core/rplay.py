@@ -48,6 +48,10 @@ class RPlayConnectionError(RPlayAPIError):
     pass
 
 
+class RPlayBrowserCheckError(RPlayAPIError):
+    """RPlay answered with its browser check; a script cannot read this endpoint."""
+
+
 class _PlaybackDeniedError(Exception):
     """play-urls refused this viewer (403): likely paid or private, not bad credentials."""
 
@@ -130,7 +134,8 @@ class RPlayAPI:
     def get_livestream_status(self, creator_oids: Iterable[str]) -> List[LiveStream]:
         """Live streams among creator_oids.
 
-        Raises RPlayAuthError on 401 and RPlayConnectionError on timeout or lost connection.
+        Raises RPlayAuthError on 401, RPlayBrowserCheckError when RPlay gates the
+        endpoint, and RPlayConnectionError on timeout or lost connection.
         """
         try:
             streams = []
@@ -226,6 +231,11 @@ class RPlayAPI:
         if response.status_code == 401:
             raise RPlayAuthError("Authentication failed while fetching playback URLs")
         if response.status_code == 403:
+            if response.headers.get("x-browser-check") == "required":
+                # Applies to every creator, so fail the whole poll instead of skipping one.
+                raise RPlayBrowserCheckError(
+                    "RPlay requires a browser check for playback URLs"
+                )
             raise _PlaybackDeniedError()
         if response.status_code in RETRY_STATUS_CODES:
             raise _RetryableStatusCodeError(response.status_code)
