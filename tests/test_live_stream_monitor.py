@@ -10,7 +10,13 @@ import pytest
 from core import health
 from core.config import ConfigError
 from core.live_stream_monitor import LiveStreamMonitor
-from core.rplay import RPlayAPI, RPlayAPIError, RPlayAuthError, RPlayConnectionError
+from core.rplay import (
+    RPlayAPI,
+    RPlayAPIError,
+    RPlayAuthError,
+    RPlayBrowserCheckError,
+    RPlayConnectionError,
+)
 from models.config import AppConfig, CreatorProfile
 from models.download import (
     DownloadSession,
@@ -1397,3 +1403,36 @@ class TestMonitorHeartbeatFile:
         monitor.check_live_streams_and_start_download()
         assert path.exists()
         assert monitor.is_healthy is False
+
+
+class TestBrowserCheck:
+    """RPlay gating play-urls is reported once, not once per poll."""
+
+    def test_notifies_once_per_blocked_streak(self, monitor, mock_api, mock_read_config):
+        mock_read_config.return_value = _creator1_config()
+        monitor.notifier = MagicMock()
+        mock_api.get_livestream_status.side_effect = RPlayBrowserCheckError("gated")
+
+        monitor.check_live_streams_and_start_download()
+        monitor.check_live_streams_and_start_download()
+
+        kinds = [call.args[0].kind for call in monitor.notifier.notify.call_args_list]
+        assert kinds == ["browser_check"]
+        assert monitor._last_check_success is False
+
+    def test_clean_poll_rearms_the_notification(
+        self, monitor, mock_api, mock_read_config
+    ):
+        mock_read_config.return_value = _creator1_config()
+        monitor.notifier = MagicMock()
+        mock_api.get_livestream_status.side_effect = [
+            RPlayBrowserCheckError("gated"),
+            [],
+            RPlayBrowserCheckError("gated"),
+        ]
+
+        for _ in range(3):
+            monitor.check_live_streams_and_start_download()
+
+        kinds = [call.args[0].kind for call in monitor.notifier.notify.call_args_list]
+        assert kinds == ["browser_check", "browser_check"]

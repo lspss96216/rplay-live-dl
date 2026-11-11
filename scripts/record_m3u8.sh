@@ -5,7 +5,8 @@
 #   scripts/record_m3u8.sh <url> [creator]  # creator defaults to $DEFAULT_CREATOR or "manual"
 #
 # Records into hidden .ts parts under archive/<creator>/, reconnects on drops,
-# then joins the parts into archive/<creator>/<creator> <time>.mp4.
+# then joins the parts into archive/<creator>/<creator> <time>.mp4. The stream
+# counts as over after 3 reconnects in a row that record nothing.
 # Ctrl+C stops recording and still saves what was recorded.
 #
 # Env: ARCHIVE_DIR (default <repo>/archive), DEFAULT_CREATOR,
@@ -29,29 +30,38 @@ stop=0
 trap 'stop=1' INT TERM
 
 say() { echo "$(date '+%F %T') [$stem] $*" | tee -a "$log"; }
-hook() { [ -n "$RECORD_HOOK" ] && $RECORD_HOOK "$@"; }
+# RECORD_HOOK is split into words by bash -c, so quote paths that contain spaces.
+hook() { [ -n "$RECORD_HOOK" ] && bash -c "$RECORD_HOOK \"\$@\"" hook "$@"; }
 
 parts=()
-quick_fails=0
-for n in $(seq -w 1 50); do
+empty_tries=0
+for n in $(seq -w 1 200); do
   part="$out_dir/.${stem}_r${n}.ts"
-  start=$(date +%s)
   say "part $n start"
   ffmpeg -hide_banner -loglevel warning -nostdin \
     -rw_timeout 30000000 -i "$URL" -c copy -f mpegts "$part" 2>>"$log"
   status=$?
-  [ -s "$part" ] && parts+=("$part") || rm -f "$part"
   say "part $n exit $status"
 
-  [ $stop -eq 1 ] && break
-  [ $status -eq 0 ] && break            # stream ended normally
-  if [ $(( $(date +%s) - start )) -lt 15 ]; then
-    quick_fails=$((quick_fails + 1))
-    # Repeated instant failures: stream is over or the URL expired.
-    [ $quick_fails -ge 3 ] && { say "URL stopped working (ended or expired)."; break; }
+  # ffmpeg also exits 0 when the connection drops mid-stream, so the exit code
+  # cannot tell "ended" from "dropped": always reconnect, and stop only after
+  # several attempts in a row that record nothing (stream over or URL expired).
+  if [ -s "$part" ]; then
+    parts+=("$part")
+    empty_tries=0
   else
-    quick_fails=0
+    rm -f "$part"
+    empty_tries=$((empty_tries + 1))
   fi
+  [ $stop -eq 1 ] && break
+  # A finished playlist (ENDLIST) reports a duration; a live one does not.
+  # Without this a finished playlist would be downloaded again from the start.
+  if [ $status -eq 0 ] && ffprobe -v error -rw_timeout 15000000 -show_entries format=duration \
+       -of csv=p=0 "$URL" 2>/dev/null | grep -Eq '^[0-9]'; then
+    say "Playlist is finished."
+    break
+  fi
+  [ $empty_tries -ge 3 ] && { say "URL stopped working (ended or expired)."; break; }
   sleep 5
 done
 

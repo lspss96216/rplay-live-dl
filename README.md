@@ -53,6 +53,9 @@
 
 本 fork 基於上游 [Zhen-Bo/rplay-live-dl](https://github.com/Zhen-Bo/rplay-live-dl) v2.6.0，修正 2026 年 10 月 RPlay 改版後**偵測不到開台、也錄不到影片**的問題。
 
+> [!WARNING]
+> **2026-11-04 起自動偵測已失效。** RPlay 把 `/live/bytedance/play-urls` 也放到瀏覽器驗證後面，對所有實況主一律回 `403 {"code":"BROWSER_CHECK_REQUIRED"}`（標頭 `x-browser-check: required`）。主程式現在偵測不到任何開台；它會發一次 `browser_check` 通知，並把該輪檢查標成失敗。本 fork 不會繞過這個驗證，目前唯一可用的錄影方式是下方的[手動錄影](#manual-m3u8)。下面「改了哪裡」與「驗證」描述的自動流程，是 11/4 之前可運作的狀態。
+
 ### 為什麼要改
 
 RPlay 改了兩件事，讓原版失效：
@@ -72,23 +75,26 @@ RPlay 改了兩件事，讓原版失效：
 | `core/downloader.py` | **斷線重試**：每次重試都重新取得播放網址，並寫進新的分段檔（`…_r01.ts`、`…_r02.ts`），合併時依序接起來。原版重試會覆蓋前一次錄到的內容。如果重試時已取不到網址（通常代表關台），就用已錄到的內容結束並合併。 |
 | `core/live_stream_monitor.py` | 傳入要檢查的實況主清單，並把「重新取得網址」的函式交給下載器，供重試使用。 |
 | `scripts/record_m3u8.sh` | **手動錄影**：新增。給無法自動偵測的 Amazon IVS 串流使用，貼上從瀏覽器取得的 m3u8 網址即可錄影、斷線重連、結束後合併成 MP4，詳見下方「手動錄影」。 |
-| `tests/` | 依新介面改寫狀態與網址相關測試，並新增重試分段、網址重取、ffmpeg 參數過濾的測試，共 534 個測試通過。 |
+| `core/rplay.py`、`core/live_stream_monitor.py` | **瀏覽器驗證**：play-urls 回 403 且帶 `x-browser-check: required` 時，拋出 `RPlayBrowserCheckError` 讓整輪檢查失敗，並發一次 `browser_check` Discord 通知（恢復後再遇到才會再發）。原本會被當成「付費或私人直播」逐一略過，等於無聲失效。 |
+| `tests/` | 依新介面改寫狀態與網址相關測試，並新增重試分段、網址重取、ffmpeg 參數過濾、瀏覽器驗證的測試，共 538 個測試通過。 |
 
 ### 驗證
 
 已在真實的 BytePlus 直播上端對端測試：程式自動偵測到開台、自動開始錄影，連續錄約 4 分鐘（跨過網址的 180 秒效期也沒有中斷），停止後自動合併成可完整解碼的 MP4（1280×720，標題與實況主資訊已寫入檔案）。
 
-### 手動錄影：無法自動偵測的串流（Amazon IVS）
+<a id="manual-m3u8"></a>
+
+### 手動錄影：貼上 m3u8 網址
 
 RPlay 上的直播有三種來源，網站播放器依序嘗試：
 
-| 串流 | 播放網址來源 | 本程式 |
+| 串流 | 播放網址來源 | 自動偵測 |
 | --- | --- | --- |
-| BytePlus | `/live/bytedance/play-urls` 回傳 `mode: "signed"` | ✅ 自動偵測、自動錄影 |
-| RPlay 自家伺服器（legacy） | `/live/bytedance/play-urls` 回傳 `mode: "legacy"` | ✅ 自動偵測（尚未在真實直播上驗證） |
-| Amazon IVS | 只放在 `/live/play` 的 `playUrl` | ❌ 偵測不到 |
+| BytePlus | `/live/bytedance/play-urls` 回傳 `mode: "signed"` | ❌ 2026-11-04 起被瀏覽器驗證擋住（之前可用） |
+| RPlay 自家伺服器（legacy） | `/live/bytedance/play-urls` 回傳 `mode: "legacy"` | ❌ 同上（從未在真實直播上驗證） |
+| Amazon IVS | 只放在 `/live/play` 的 `playUrl` | ❌ 一直都偵測不到 |
 
-IVS 串流的開台狀態與播放網址只存在於受瀏覽器驗證保護的 `/live/play`，程式拿到的永遠是 `offline` 和空網址，所以無法自動偵測。本 fork 不會嘗試繞過這個驗證，改提供手動錄影腳本：由你在自己的瀏覽器取得 m3u8 網址，再交給腳本錄影。
+開台狀態與播放網址現在都只存在於受瀏覽器驗證保護的 API 裡。本 fork 不會嘗試繞過這個驗證，改提供手動錄影腳本：由你在自己的瀏覽器取得 m3u8 網址，再交給腳本錄影。下面的步驟以 Amazon IVS 串流為例，也是唯一實際驗證過的類型。
 
 可以用 `/live/play?creatorOid=<id>&withoutLiveState=true` 回傳的 `useBytePlusStream` 判斷實況主是不是 BytePlus；不是 BytePlus、play-urls 又沒有回傳網址的，多半就是 IVS。
 
@@ -108,18 +114,18 @@ scripts/record_m3u8.sh '<m3u8 網址>' お子  # 或直接帶參數，第二個�
 
 - 需要 `ffmpeg` 與 `ffprobe` 在 `PATH` 上。長時間錄影建議放在 `tmux` 或 `screen` 裡執行。
 - 影片寫到 `archive/<名稱>/`。錄影中是隱藏的 `.ts` 分段，直播結束（或按 `Ctrl+C`）後會合併成 `archive/<名稱>/<名稱> <時間>.mp4`，合併完成前不會出現可見的 `.mp4`。
-- 斷線會自動重連並寫成新的分段，最後依序合併。連續 3 次在 15 秒內失敗，視為直播結束或網址過期，用已錄到的內容收尾。
+- 斷線會自動重連並寫成新的分段，最後依序合併。ffmpeg 在連線中斷時也可能回傳 0，所以不看結束碼，一律重連；連續 3 次重連都錄不到內容，才視為直播結束或網址過期，用已錄到的內容收尾。播放清單已標示結束（`#EXT-X-ENDLIST`）時會直接收尾。
 - 網址每場都不同，可能帶有效期限；錄到一半失效但直播還在播時，重新抓一次網址再執行即可。
 - 網址不會寫進 log（`logs/record_m3u8.log`）。
-- 環境變數：`ARCHIVE_DIR`（預設 `archive`）、`DEFAULT_CREATOR`（預設 `manual`）、`RECORD_HOOK`（結束時執行的指令，參數為 `saved <mp4> <分段數>`、`merge_failed <名稱> <資料夾>` 或 `nothing <名稱>`，可用來接自己的通知或上傳流程）。
+- 環境變數：`ARCHIVE_DIR`（預設 `archive`）、`DEFAULT_CREATOR`（預設 `manual`）、`RECORD_HOOK`（結束時執行的指令，參數為 `saved <mp4> <分段數>`、`merge_failed <名稱> <資料夾>` 或 `nothing <名稱>`，可用來接自己的通知或上傳流程；指令會交給 `bash -c` 執行，路徑含空白時要自己加引號）。
 
 已在真實的 IVS 直播上測試：從伺服器錄完整場約 25 分鐘，沒有中斷，輸出 1280×720 60fps、含 AAC 音訊的 MP4。
 
 ### 限制
 
-- 偵測方式是逐一詢問每位實況主的播放網址，每輪檢查的請求數會隨監控人數增加。這是在避開 RPlay 對清單 API 的瀏覽器檢查；如果 RPlay 之後對 play-urls 也加上限制，就需要再調整。
-- RPlay 自家伺服器（legacy）串流的網址格式是依網站前端程式碼實作的，尚未在真實的直播上驗證。
-- Amazon IVS 串流無法自動偵測，只能用上面的手動錄影腳本，從開台到貼上網址之間的內容會錄不到。
+- **自動偵測目前無法運作**（見最上方的警告）。主程式啟動後只會收到瀏覽器驗證的拒絕，持續輪詢沒有意義，建議先不要執行，除非 RPlay 取消這個限制。
+- 所有串流都只能用上面的手動錄影腳本，從開台到貼上網址之間的內容會錄不到。
+- RPlay 自家伺服器（legacy）串流的網址格式是依網站前端程式碼實作的，從未在真實的直播上驗證。
 - 開播時間是本機第一次偵測到的時間，不是 RPlay 上實際的開播時間；程式重啟後同一場直播會被視為新的一場。
 
 ---
@@ -454,6 +460,7 @@ set, so it does not hide the cards.
 | `offline` | A previously observed RPlay stream is absent from two successful status polls, or is replaced by a new stream start time; not proof recording/merge completed |
 | `blocked` | Download access is denied under the existing 403/404 retry policy; possibly paid/private, not a confirmed paid classification |
 | `auth_failed` | Startup or runtime RPlay credentials are rejected |
+| `browser_check` | RPlay answers the playback-URL request with its browser check (`x-browser-check: required`); sent once per blocked streak, automatic detection cannot work while it lasts |
 | `download_failed` | Repeated raw download failures enter the existing retry cooldown |
 | `merge_failed` | Normal merge or startup recovery fails, including insufficient merge space; raw inputs retained |
 | `merge_completed` | Normal merge or startup recovery installs a validated, nonempty MP4; includes its filename |
@@ -497,7 +504,7 @@ operator guidance instead of raw upstream errors, credentials, or stream URLs.
 
 #### Preview notification cards
 
-From the project root, run this manual tester to send eight simulated cards to
+From the project root, run this manual tester to send nine simulated cards to
 the channel associated with `DISCORD_WEBHOOK_URL`:
 
 ```powershell
@@ -507,8 +514,8 @@ the channel associated with `DISCORD_WEBHOOK_URL`:
 Or use `poetry run python scripts/test_discord_cards.py`. The script reads the
 project-root `.env`; an environment variable takes precedence. No RPlay account
 credentials are required. It deliberately ignores `DISCORD_WEBHOOK_EVENTS` so
-you can preview all eight types: live, restricted access, authentication
-failure, delayed retries, merge failure, merge completion, low space, and critical space.
+you can preview all nine types: live, restricted access, authentication
+failure, blocked live detection, delayed retries, merge failure, merge completion, low space, and critical space.
 
 Cards use the production layout without test labels or sequence numbers.
 These are simulated notifications, not real events; use a suitable preview channel.

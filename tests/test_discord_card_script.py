@@ -10,7 +10,7 @@ from scripts import test_discord_cards as script
 URL = "https://discord.com/api/webhooks/123456/test-token"
 
 
-@pytest.mark.parametrize("args,count", [([], 8), (["--include-offline"], 9)])
+@pytest.mark.parametrize("args,count", [([], 9), (["--include-offline"], 10)])
 @responses.activate
 def test_sends_real_card_payloads(monkeypatch, capsys, args, count):
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", URL)
@@ -40,7 +40,7 @@ def test_sends_real_card_payloads(monkeypatch, capsys, args, count):
     assert live["description"].endswith("**")
     assert live["thumbnail"]["url"] == live["author"]["icon_url"]
     assert "Late-night chat" in live["description"]
-    auth_index = 3 if count == 9 else 2
+    auth_index = 3 if count == 10 else 2
     auth = json.loads(responses.calls[auth_index].request.body)["embeds"][0]
     assert auth["title"] == "🔑 Authentication failed"
     assert "author" not in auth
@@ -59,7 +59,7 @@ def test_dry_run_does_not_read_credentials_or_send(monkeypatch, capsys):
 
     monkeypatch.setattr(script, "dotenv_values", forbidden)
     assert script.main(["--dry-run"]) == 0
-    assert len(json.loads(capsys.readouterr().out)) == 8
+    assert len(json.loads(capsys.readouterr().out)) == 9
     assert not responses.calls
 
 
@@ -69,7 +69,7 @@ def test_reads_project_dotenv_independently_of_cwd(monkeypatch, tmp_path):
     monkeypatch.setattr(script, "ROOT", tmp_path)
     responses.add(responses.POST, URL, status=204)
     assert script.main([]) == 0
-    assert len(responses.calls) == 8
+    assert len(responses.calls) == 9
 
 
 @pytest.mark.parametrize("value", ["", "https://example.com/private-secret"])
@@ -93,6 +93,6 @@ def test_failed_delivery_stops_without_claiming_success(monkeypatch, capsys, cap
     assert script.main([]) == 1
     assert len(responses.calls) == 1
     output = capsys.readouterr()
-    assert "Confirmed deliveries: 0/8" in output.out
+    assert "Confirmed deliveries: 0/9" in output.out
     assert "FAILED: live" in output.err
     assert "test-token" not in output.out + output.err + caplog.text
